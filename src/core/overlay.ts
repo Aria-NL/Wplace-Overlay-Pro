@@ -1,24 +1,26 @@
 import { createCanvas, canvasToBlob, blobToImage, loadImage } from './canvas';
 import { MINIFY_SCALE, MINIFY_SCALE_SYMBOL, TILE_SIZE, MAX_OVERLAY_DIM } from './constants';
-import { imageDecodeCache, overlayCache, tooLargeOverlays, paletteDetectionCache, baseMinifyCache, clearOverlayCache, overlayImageDataCache } from './cache';
+import { imageDecodeCache, overlayCache, tooLargeOverlays, paletteDetectionCache, baseMinifyCache, clearOverlayCache, overlayImageDataCache, LRUCache } from './cache';
 import { showToast } from './toast';
 import { config, saveConfig, type OverlayItem } from './store';
 import { WPLACE_FREE, WPLACE_PAID, SYMBOL_TILES, SYMBOL_W, SYMBOL_H } from './palette';
 import { getUpdateUI, ensureHook } from './hook';
 
+// --- RLE Optimization: Types and Cache ---
+type Run = { colorIndex: number; length: number };
+type RLEData = Run[][];
+const overlayRLECache = new LRUCache<string, RLEData>(50); // Cache for run-length encoded overlay data
+
 const ALL_COLORS = [...WPLACE_FREE, ...WPLACE_PAID];
 const colorIndexMap = new Map<string, number>();
 ALL_COLORS.forEach((c, i) => colorIndexMap.set(c.join(','), i));
 
-const LUT_SIZE = 32; // 32x32x32 = 32KB
-const LUT_SHIFT = 8 - Math.log2(LUT_SIZE); // 3 for 32x32x32
+const LUT_SIZE = 32;
+const LUT_SHIFT = 8 - Math.log2(LUT_SIZE);
 const colorLUT = new Uint8Array(LUT_SIZE * LUT_SIZE * LUT_SIZE);
-
-// --- OPTIMIZATION: Cache for pre-rendered symbols ---
-// This avoids re-drawing the 5x5 symbol pixel-by-pixel every single time.
-// We render each symbol once and then use the fast ctx.drawImage().
 const symbolCache = new Map<number, OffscreenCanvas | HTMLCanvasElement>();
 
+// (buildColorLUT, findColorIndexLUT, findClosestColorIndex, getPreRenderedSymbol functions are unchanged)
 function buildColorLUT() {
   for (let r = 0; r < LUT_SIZE; r++) {
     for (let g = 0; g < LUT_SIZE; g++) {
@@ -32,51 +34,12 @@ function buildColorLUT() {
     }
   }
 }
-
 function findColorIndexLUT(r: number, g: number, b: number): number {
   const lutR = r >> LUT_SHIFT;
   const lutG = g >> LUT_SHIFT;
   const lutB = b >> LUT_SHIFT;
   return colorLUT[lutR * LUT_SIZE * LUT_SIZE + lutG * LUT_SIZE + lutB];
 }
-
-buildColorLUT();
-
-// --- OPTIMIZATION: Pre-renders a symbol for a given color index ---
-function getPreRenderedSymbol(colorIndex: number): OffscreenCanvas | HTMLCanvasElement | null {
-    if (symbolCache.has(colorIndex)) {
-        return symbolCache.get(colorIndex)!;
-    }
-
-    if (colorIndex >= SYMBOL_TILES.length) return null;
-
-    const scale = MINIFY_SCALE_SYMBOL;
-    const canvas = createCanvas(scale, scale);
-    // Type assertion is needed because TypeScript can't guarantee the context has drawing methods like 'fillStyle'.
-    const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
-    if (!ctx) return null;
-
-    const symbol = SYMBOL_TILES[colorIndex];
-    const paletteColor = ALL_COLORS[colorIndex];
-    ctx.fillStyle = `rgb(${paletteColor[0]}, ${paletteColor[1]}, ${paletteColor[2]})`;
-
-    const centerX = (scale - SYMBOL_W) >> 1;
-    const centerY = (scale - SYMBOL_H) >> 1;
-
-    for (let sy = 0; sy < SYMBOL_H; sy++) {
-        for (let sx = 0; sx < SYMBOL_W; sx++) {
-            const bit_idx = sy * SYMBOL_W + sx;
-            if ((symbol >>> bit_idx) & 1) {
-                ctx.fillRect(sx + centerX, sy + centerY, 1, 1);
-            }
-        }
-    }
-    
-    symbolCache.set(colorIndex, canvas);
-    return canvas;
-}
-
-
 function findClosestColorIndex(r: number, g: number, b: number) {
   let minDistance = Infinity;
   let index = 0;
@@ -94,6 +57,67 @@ function findClosestColorIndex(r: number, g: number, b: number) {
   }
   return index;
 }
+function getPreRenderedSymbol(colorIndex: number): OffscreenCanvas | HTMLCanvasElement | null {
+    const cachedSymbol = symbolCache.get(colorIndex);
+    if (cachedSymbol) {
+        return cachedSymbol;
+    }
+
+    if (colorIndex >= SYMBOL_TILES.length) return null;
+    const scale = MINIFY_SCALE_SYMBOL;
+    const canvas = createCanvas(scale, scale);
+    const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
+    if (!ctx) return null;
+    const symbol = SYMBOL_TILES[colorIndex];
+    const paletteColor = ALL_COLORS[colorIndex];
+    ctx.fillStyle = `rgb(${paletteColor[0]}, ${paletteColor[1]}, ${paletteColor[2]})`;
+    const centerX = (scale - SYMBOL_W) >> 1;
+    const centerY = (scale - SYMBOL_H) >> 1;
+    for (let sy = 0; sy < SYMBOL_H; sy++) {
+        for (let sx = 0; sx < SYMBOL_W; sx++) {
+            const bit_idx = sy * SYMBOL_W + sx;
+            if ((symbol >>> bit_idx) & 1) {
+                ctx.fillRect(sx + centerX, sy + centerY, 1, 1);
+            }
+        }
+    }
+    symbolCache.set(colorIndex, canvas);
+    return canvas;
+}
+
+buildColorLUT();
+
+// --- RLE Optimization: Function to generate RLE data from ImageData ---
+function generateRLEData(imageData: ImageData, isPalettePerfect: boolean): RLEData {
+    const { width, height, data } = imageData;
+    const rleData: RLEData = [];
+
+    for (let y = 0; y < height; y++) {
+        const row: Run[] = [];
+        let currentRun: Run | null = null;
+
+        for (let x = 0; x < width; x++) {
+            const i = (y * width + x) * 4;
+            const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
+
+            // Treat transparent or #deface as "no color" (index -1)
+            const colorIndex = (a <= 128 || (r === 0xde && g === 0xfa && b === 0xce))
+                ? -1
+                : (isPalettePerfect ? (colorIndexMap.get(`${r},${g},${b}`) ?? -1) : findColorIndexLUT(r, g, b));
+
+            if (currentRun && currentRun.colorIndex === colorIndex) {
+                currentRun.length++;
+            } else {
+                if (currentRun) row.push(currentRun);
+                currentRun = { colorIndex, length: 1 };
+            }
+        }
+        if (currentRun) row.push(currentRun);
+        rleData.push(row);
+    }
+    return rleData;
+}
+
 
 export function extractPixelCoords(pixelUrl: string) {
   try {
@@ -110,7 +134,6 @@ export function extractPixelCoords(pixelUrl: string) {
     return { chunk1: 0, chunk2: 0, posX: 0, posY: 0 };
   }
 }
-
 export function matchTileUrl(urlStr: string) {
   try {
     const u = new URL(urlStr, location.href);
@@ -120,7 +143,6 @@ export function matchTileUrl(urlStr: string) {
     return { chunk1: parseInt(m[1], 10), chunk2: parseInt(m[2], 10) };
   } catch { return null; }
 }
-
 export function matchPixelUrl(urlStr: string) {
   try {
     const u = new URL(urlStr, location.href);
@@ -131,45 +153,35 @@ export function matchPixelUrl(urlStr: string) {
     return { normalized: `https://backend.wplace.live/s0/pixel/${m[1]}/${m[2]}?x=${sp.get('x')||0}&y=${sp.get('y')||0}` };
   } catch { return null; }
 }
-
 export function rectIntersect(ax: number, ay: number, aw: number, ah: number, bx: number, by: number, bw: number, bh: number) {
   const x = Math.max(ax, bx), y = Math.max(ay, by);
   const r = Math.min(ax + aw, bx + bw), b = Math.min(ay + ah, by + bh);
   const w = Math.max(0, r - x), h = Math.max(0, b - y);
   return { x, y, w, h };
 }
-
 function isPalettePerfectImage(img: HTMLImageElement): boolean {
   const key = img.src;
   const cached = paletteDetectionCache.get(key);
   if (cached !== undefined) return cached;
-
   const canvas = createCanvas(img.width, img.height) as any;
   const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
   if (!ctx) throw new Error('Failed to get 2D context');
   ctx.drawImage(img, 0, 0);
   const imageData = ctx.getImageData(0, 0, img.width, img.height);
   const data = imageData.data;
-
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i], g = data[i+1], b = data[i+2], a = data[i+3];
-    
     if (a === 0) continue;
-    
-    // Skip #deface transparency
     if (r === 0xde && g === 0xfa && b === 0xce) continue;
-    
     const colorKey = `${r},${g},${b}`;
     if (!colorIndexMap.has(colorKey)) {
       paletteDetectionCache.set(key, false);
       return false;
     }
   }
-  
   paletteDetectionCache.set(key, true);
   return true;
 }
-
 export async function decodeOverlayImage(imageBase64: string | null) {
   if (!imageBase64) return null;
   const key = imageBase64;
@@ -179,7 +191,6 @@ export async function decodeOverlayImage(imageBase64: string | null) {
   imageDecodeCache.set(key, img);
   return img;
 }
-
 export function overlaySignature(ov: {
   imageBase64: string | null,
   pixelUrl: string | null,
@@ -191,12 +202,10 @@ export function overlaySignature(ov: {
   const perfectFlag = isPalettePerfect !== undefined ? (isPalettePerfect ? 'P' : 'I') : 'U';
   return [imgKey, ov.pixelUrl || 'null', ov.offsetX, ov.offsetY, ov.opacity, perfectFlag].join('|');
 }
-
 async function getCachedOverlayImageData(img: HTMLImageElement, overlayId: string): Promise<ImageData> {
   const cacheKey = `${overlayId}:${img.width}x${img.height}`;
   const cached = overlayImageDataCache.get(cacheKey);
   if (cached) return cached;
-
   const canvas = createCanvas(img.width, img.height) as any;
   const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
   if (!ctx) throw new Error('Failed to get 2D context');
@@ -205,6 +214,7 @@ async function getCachedOverlayImageData(img: HTMLImageElement, overlayId: strin
   overlayImageDataCache.set(cacheKey, imageData);
   return imageData;
 }
+
 
 export async function buildOverlayDataForChunkUnified(
   ov: {
@@ -242,31 +252,25 @@ export async function buildOverlayDataForChunkUnified(
   if (cached !== undefined) return cached;
 
   if (mode !== 'minify') {
+    // This part for 'behind' and 'above' modes is unchanged
     const isect = rectIntersect(0, 0, TILE_SIZE, TILE_SIZE, drawX, drawY, wImg, hImg);
     if (isect.w === 0 || isect.h === 0) { overlayCache.set(cacheKey, null); return null; }
-
     const canvas = createCanvas(isect.w, isect.h) as any;
     const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
     if (!ctx) throw new Error('Failed to get 2D context');
-
-    // Draw the relevant part of the overlay image
     ctx.drawImage(img as any, isect.x - drawX, isect.y - drawY, isect.w, isect.h, 0, 0, isect.w, isect.h);
-    
-    // Apply opacity effect
     ctx.globalCompositeOperation = 'source-in';
     ctx.fillStyle = `rgba(255, 255, 255, ${1 - ov.opacity})`;
     ctx.fillRect(0, 0, isect.w, isect.h);
-    
     ctx.globalCompositeOperation = 'destination-over';
     ctx.fillStyle = `rgba(255, 255, 255, 1)`;
     ctx.fillRect(0, 0, isect.w, isect.h);
-
     const imageData = ctx.getImageData(0, 0, isect.w, isect.h);
     const result = { imageData, dx: isect.x, dy: isect.y, scaled: false };
     overlayCache.set(cacheKey, result);
     return result;
 
-  } else { // Minify modes
+  } else { // --- RLE Optimized Minify Rendering ---
     const scale = config.minifyStyle === 'symbols' ? MINIFY_SCALE_SYMBOL : MINIFY_SCALE;
     const tileScaledW = TILE_SIZE * scale;
     const tileScaledH = TILE_SIZE * scale;
@@ -278,52 +282,66 @@ export async function buildOverlayDataForChunkUnified(
     const isect = rectIntersect(0, 0, tileScaledW, tileScaledH, drawXScaled, drawYScaled, wImgScaled, hImgScaled);
     if (isect.w === 0 || isect.h === 0) { overlayCache.set(cacheKey, null); return null; }
 
-    const originalImageData = await getCachedOverlayImageData(img, ov.id);
-    const srcData = originalImageData.data;
+    // Get or generate RLE data for the overlay
+    const rleCacheKey = `${ov.id}:${sig}`;
+    let rleData = overlayRLECache.get(rleCacheKey);
+    if (!rleData) {
+        const originalImageData = await getCachedOverlayImageData(img, ov.id);
+        rleData = generateRLEData(originalImageData, isPalettePerfect);
+        overlayRLECache.set(rleCacheKey, rleData);
+    }
     
     const outCanvas = createCanvas(isect.w, isect.h) as any;
     const outCtx = outCanvas.getContext('2d') as CanvasRenderingContext2D;
     if (!outCtx) throw new Error('Failed to get 2D context');
 
-    // Calculate the range of source image pixels to iterate over
-    const startX = Math.max(0, Math.floor((isect.x - drawXScaled) / scale));
+    // Calculate the range of source image rows to iterate over
     const startY = Math.max(0, Math.floor((isect.y - drawYScaled) / scale));
-    const endX = Math.min(wImg, Math.ceil((isect.x + isect.w - drawXScaled) / scale));
     const endY = Math.min(hImg, Math.ceil((isect.y + isect.h - drawYScaled) / scale));
 
-    if (config.minifyStyle === 'symbols') {
-      for (let y = startY; y < endY; y++) {
-        for (let x = startX; x < endX; x++) {
-          const srcIdx = (y * wImg + x) * 4;
-          const r = srcData[srcIdx], g = srcData[srcIdx + 1], b = srcData[srcIdx + 2], a = srcData[srcIdx + 3];
+    for (let y = startY; y < endY; y++) {
+        const rowRLE = rleData[y];
+        let currentX = 0;
+        const outY = drawYScaled + y * scale - isect.y;
 
-          if (a <= 128 || (r === 0xde && g === 0xfa && b === 0xce)) continue;
+        for (const run of rowRLE) {
+            if (run.colorIndex !== -1) {
+                const runStartImgX = currentX;
+                const runEndImgX = currentX + run.length;
 
-          const colorIndex = isPalettePerfect ? (colorIndexMap.get(`${r},${g},${b}`) ?? 0) : findColorIndexLUT(r, g, b);
-          
-          const symbolCanvas = getPreRenderedSymbol(colorIndex);
-          if (symbolCanvas) {
-            const outX = Math.round(drawX * scale) + x * scale - isect.x;
-            const outY = Math.round(drawY * scale) + y * scale - isect.y;
-            outCtx.drawImage(symbolCanvas, outX, outY);
-          }
+                // Find intersection of this run with the visible tile area
+                const visibleStartImgX = Math.max(runStartImgX, Math.floor((isect.x - drawXScaled) / scale));
+                const visibleEndImgX = Math.min(runEndImgX, Math.ceil((isect.x + isect.w - drawXScaled) / scale));
+
+                if (visibleEndImgX > visibleStartImgX) {
+                    const visibleLength = visibleEndImgX - visibleStartImgX;
+                    const outX = drawXScaled + visibleStartImgX * scale - isect.x;
+                    
+                    if (config.minifyStyle === 'symbols') {
+                        const symbolCanvas = getPreRenderedSymbol(run.colorIndex);
+                        if (symbolCanvas) {
+                            const pattern = outCtx.createPattern(symbolCanvas, 'repeat');
+                            if (pattern) {
+                                outCtx.fillStyle = pattern;
+                                // We need to translate the context so the pattern aligns with the grid
+                                outCtx.save();
+                                outCtx.translate(outX, outY);
+                                outCtx.fillRect(0, 0, visibleLength * scale, scale);
+                                outCtx.restore();
+                            }
+                        }
+                    } else { // 'dots'
+                        const color = ALL_COLORS[run.colorIndex];
+                        outCtx.fillStyle = `rgb(${color[0]},${color[1]},${color[2]})`;
+                        const center = Math.floor(scale / 2);
+                        for (let i = 0; i < visibleLength; i++) {
+                            outCtx.fillRect(outX + i * scale + center, outY + center, 1, 1);
+                        }
+                    }
+                }
+            }
+            currentX += run.length;
         }
-      }
-    } else { // 'dots'
-      const center = Math.floor(scale / 2);
-      for (let y = startY; y < endY; y++) {
-        for (let x = startX; x < endX; x++) {
-          const srcIdx = (y * wImg + x) * 4;
-          const r = srcData[srcIdx], g = srcData[srcIdx + 1], b = srcData[srcIdx + 2], a = srcData[srcIdx + 3];
-
-          if (a <= 128 || (r === 0xde && g === 0xfa && b === 0xce)) continue;
-          
-          outCtx.fillStyle = `rgb(${r}, ${g}, ${b})`;
-          const outX = Math.round(drawX * scale) + x * scale + center - isect.x;
-          const outY = Math.round(drawY * scale) + y * scale + center - isect.y;
-          outCtx.fillRect(outX, outY, 1, 1);
-        }
-      }
     }
     
     const imageData = outCtx.getImageData(0, 0, isect.w, isect.h);
@@ -333,6 +351,7 @@ export async function buildOverlayDataForChunkUnified(
   }
 }
 
+// composeTileUnified is unchanged
 export async function composeTileUnified(
   originalBlob: Blob,
   overlayDatas: Array<{ imageData: ImageData, dx: number, dy: number, scaled?: boolean } | null>,
@@ -340,18 +359,14 @@ export async function composeTileUnified(
 ) {
   if (!overlayDatas || overlayDatas.length === 0) return originalBlob;
   const originalImage = await blobToImage(originalBlob) as any;
-
   if (mode === 'minify') {
     const scale = config.minifyStyle === 'symbols' ? MINIFY_SCALE_SYMBOL : MINIFY_SCALE;
     const w = originalImage.width, h = originalImage.height;
-    
     const arrayBuffer = await originalBlob.arrayBuffer();
     const view = new DataView(arrayBuffer);
     const hash = view.getUint32(0, true) ^ view.getUint32(view.byteLength - 4, true);
-
     const baseCacheKey = `base:${originalBlob.size}:${hash}:${w}x${h}:${scale}:${config.minifyStyle}`;
     let scaledBaseImageData = baseMinifyCache.get(baseCacheKey);
-
     if (!scaledBaseImageData) {
       const baseCanvas = createCanvas(w * scale, h * scale) as any;
       const baseCtx = baseCanvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
@@ -361,15 +376,12 @@ export async function composeTileUnified(
       scaledBaseImageData = baseCtx.getImageData(0, 0, w * scale, h * scale);
       baseMinifyCache.set(baseCacheKey, scaledBaseImageData);
     }
-    
     const canvas = createCanvas(w * scale, h * scale) as any;
     const ctx = canvas.getContext('2d', { willReadFrequently: true }) as CanvasRenderingContext2D;
     if (!ctx) throw new Error('Failed to get 2D context');
     ctx.putImageData(scaledBaseImageData, 0, 0);
-
     for (const ovd of overlayDatas) {
       if (!ovd) continue;
-      // Use a temporary canvas to draw the overlay data, which is faster
       const temp = createCanvas(ovd.imageData.width, ovd.imageData.height) as any;
       const tctx = temp.getContext('2d') as CanvasRenderingContext2D;
       if (!tctx) continue;
@@ -378,13 +390,10 @@ export async function composeTileUnified(
     }
     return await canvasToBlob(canvas);
   }
-
-  // Standard 'above' or 'behind' modes
   const w = originalImage.width, h = originalImage.height;
   const canvas = createCanvas(w, h) as any;
   const ctx = canvas.getContext('2d') as CanvasRenderingContext2D;
   if (!ctx) throw new Error('Failed to get 2D context');
-
   const drawOverlays = () => {
     for (const ovd of overlayDatas) {
       if (!ovd) continue;
@@ -395,7 +404,6 @@ export async function composeTileUnified(
       ctx.drawImage(temp, ovd.dx, ovd.dy);
     }
   };
-
   if (mode === 'behind') {
     drawOverlays();
     ctx.drawImage(originalImage, 0, 0);
@@ -414,7 +422,7 @@ export async function displayImageFromData(newOverlay: OverlayItem) {
   await saveConfig();
   
   clearOverlayCache();
-  // Clear symbol cache in case palette changes in the future
+  overlayRLECache.clear();
   symbolCache.clear();
   ensureHook();
 
